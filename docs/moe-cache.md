@@ -9,6 +9,20 @@ When the experts of MoE layers stay in host memory (`-cmoe`, `-ncmoe`, `-ot`), t
 
 The cache hits run on the device. With `--moe-cache-cpu-share F` the CPU computes a share `F` of the misses while the device computes the hits and uploads the other misses into the cache. This is faster when the CPU reads the host experts faster than the device can upload them, for example with fast RAM, a PCIe 4 link or experts that are not in pinned memory. The host experts are pinned with `-lm none`, `-lm mlock` and `-lm dio`, unless `--no-host`, but not when they are mmap'd (the default). The device uploads pinned experts at the full speed of the link, so the CPU share often does not help then. Until the cache is full every miss is uploaded, so the cache fills as fast as without the CPU share. The best share depends on the machine, the model and the cache size.
 
+## Pinning the host experts
+
+Uploads read the experts from host memory. When that memory is pageable (mmap'd, the default), the copy call blocks the calling
+thread until the data has been staged, and the device waits for it. `LLAMA_MOE_CACHE_PIN=1` page-locks the experts of the cached
+layers in place (`hipHostRegister` / `cudaHostRegister`, read-only) when the cache is created, so the uploads become asynchronous
+DMA copies from pinned memory. Only the expert tensors of the cached layers are registered, not the whole mmap, so the rest of the
+model (for example a large embedding table) stays in the ordinary page cache.
+
+- It is off by default; set it in the environment of `llama-server`. The registration is logged at `-lv 4`
+  (`pin_host_experts: ... pinned X of Y GiB of host experts`). `VmPin` in `/proc/<pid>/status` does not show it on ROCm.
+- Pinned pages cannot be reclaimed by the kernel: the size of the host experts (the `MiB of host experts` in the cache log line)
+  is taken out of the memory available to everything else while the model is loaded.
+- Whether it helps depends on the machine; measure with and without it on your own workload.
+
 ## Picking the arguments
 
 Put the script in front of your server command:
