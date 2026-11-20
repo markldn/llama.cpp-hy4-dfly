@@ -62,6 +62,10 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
     bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
+    // dfly drafter (hy_v4_flash): target layers whose indexer selection is tapped, and the drafter's source row
+    uint32_t dfly_tap_layers[8];
+    uint32_t dfly_n_tap;
+    int32_t  dfly_src_row;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

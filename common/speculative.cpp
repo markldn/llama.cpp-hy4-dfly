@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -78,6 +79,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-dspark",   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"draft-dflash2",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2},
     {"draft-lilicorr", COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR},
+    {"draft-dfly",     COMMON_SPECULATIVE_TYPE_DRAFT_DFLY},
     {"ngram-simple",   COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v",  COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -2322,6 +2324,146 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// Hy4-flash DFly drafter (src/models/hy-v4-flash-dfly.cpp). One pass drafts up to n tokens from the target's last hidden
+// state, its own K/V cache and its indexer selection of the source row; the draft context has no memory of its own.
+// The row that chose the next anchor is found from positions, so accept() has nothing to track.
+struct common_speculative_impl_draft_dfly : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    common_batch batch;
+
+    llama_token mask_id = 0;
+    int32_t     n_block = 5; // tokens the drafter drafts per pass
+
+    // positions of the rows of the last target decode (taps and hidden rows only exist for decodes of <= 16 rows)
+    std::vector<llama_pos> rows_pos;
+
+    common_speculative_impl_draft_dfly(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLY, n_seq, params.draft.n_max)
+        , params(params.draft)
+    {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        GGML_ASSERT(ctx_tgt && ctx_dft && "draft-dfly requires ctx_tgt and ctx_dft to be set");
+
+        if (n_seq != 1) {
+            throw std::runtime_error("draft-dfly supports a single sequence (use --parallel 1)");
+        }
+
+        uint32_t layers[8];
+        int32_t  n_spec = 0;
+        int32_t  mask   = 0;
+        const int32_t n_layers = llama_model_dfly_info(llama_get_model(ctx_dft), &n_spec, &mask, layers, 8);
+        if (n_layers <= 0) {
+            throw std::runtime_error("draft-dfly requires a hy_v4_flash_dfly draft model");
+        }
+        mask_id = mask;
+        n_block = n_spec;
+
+        this->n_max = this->params.n_max > 0 ? std::min(this->params.n_max, n_block) : n_block;
+
+        SPC_TRC("%s", "adding speculative implementation 'draft-dfly'\n");
+        SPC_TRC("- n_max=%d (drafter block %d), mask_id=%d, tapped target layers=%d\n", this->n_max, n_block, (int) mask_id, n_layers);
+
+        // the drafter reads the target's last hidden state, K cache and indexer selections
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_dfly_tap(ctx_tgt, layers, n_layers);
+
+        batch = common_batch(ctx_dft);
+    }
+
+    ~common_speculative_impl_draft_dfly() override {
+        if (params.ctx_tgt) {
+            llama_set_dfly_tap(params.ctx_tgt, nullptr, 0);
+            llama_set_embeddings_nextn(params.ctx_tgt, false, false);
+        }
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        rows_pos.clear();
+    }
+
+    bool process(const common_batch & batch_in) override {
+        rows_pos.resize(batch_in.tokens.size());
+        for (size_t i = 0; i < batch_in.tokens.size(); ++i) {
+            rows_pos[i] = batch_in.tokens[i].pos[0];
+        }
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto & dp = dparams[0];
+        if (!dp.drafting) {
+            return;
+        }
+
+        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_dft = params.ctx_dft;
+
+        const int32_t n_rows = (int32_t) rows_pos.size();
+        if (n_rows <= 0 || n_rows > 16) {
+            return; // no taps for large decodes (prompt chunks): the next step drafts
+        }
+
+        // the row that chose id_last is the one at position pos0 - 1
+        int32_t row = -1;
+        for (int32_t i = n_rows - 1; i >= 0; --i) {
+            if (rows_pos[i] == dp.pos0 - 1) {
+                row = i;
+                break;
+            }
+        }
+        if (row < 0) {
+            return;
+        }
+
+        int32_t k = 0;
+        int32_t rows = 0;
+        const int32_t * idx = nullptr;
+        const float   * val = nullptr;
+        if (!llama_get_dfly_tap(ctx_tgt, 0, &k, &rows, &idx, &val) || rows != n_rows || row >= rows) {
+            return;
+        }
+
+        int32_t n_draft = this->n_max;
+        if (dp.n_max > 0) {
+            n_draft = std::min(n_draft, dp.n_max);
+        }
+        n_draft = std::min(n_draft, n_block);
+        if (n_draft <= 0) {
+            return;
+        }
+
+        llama_set_dfly_src_row(ctx_dft, row);
+
+        batch.clear();
+        batch.add(dp.id_last, dp.pos0, 0, true);
+        for (int32_t j = 0; j < n_draft; ++j) {
+            batch.add(mask_id, dp.pos0 + 1 + j, 0, true);
+        }
+
+        if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_ENCODE, batch.get()) != 0) {
+            SPC_WRN("%s", "draft-dfly: drafter pass failed, no draft\n");
+            return;
+        }
+        llama_synchronize(ctx_dft);
+
+        for (int32_t j = 0; j < n_draft; ++j) {
+            const float * e = llama_get_embeddings_ith(ctx_dft, 1 + j);
+            if (e == nullptr) {
+                dp.result->clear();
+                return;
+            }
+            dp.result->push_back((llama_token) std::lround(e[0]));
+        }
+
+        // deterministic drafts: the verifier samples the target and matches
+        dp.result_q = nullptr;
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {}
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -2810,6 +2952,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:   return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:  return "draft-dflash2";
         case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: return "draft-lilicorr";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLY:     return "draft-dfly";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:   return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:    return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:  return "ngram-map-k4v";
@@ -2863,6 +3006,9 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    if (arch == "hy_v4_flash_dfly") {
+        return { COMMON_SPECULATIVE_TYPE_DRAFT_DFLY };
+    }
     if (arch != "dflash") {
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
@@ -2901,6 +3047,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
             case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLY:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -3123,6 +3270,38 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // Hy4-flash DFly drafter: five dense layers read through the target's K cache, no memory of its own. Its layers sit on
+    // the device of the target layer they read (layer split), the chain of draft steps on the device of the output head.
+    const std::vector<common_speculative_type> dfly_types =
+            has_draft ? common_speculative_types_from_gguf(params.speculative.draft.mparams.path) : std::vector<common_speculative_type>{};
+    if (!dfly_types.empty() && dfly_types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLY) {
+        static std::vector<float> dfly_ts;
+        dfly_ts.assign(std::max<size_t>(llama_max_devices(), 2), 0.0f);
+        dfly_ts[0] = 0.42f;
+        dfly_ts[1] = 0.58f;
+        if (const char * env = getenv("LLAMA_DFLY_TS")) {
+            std::string v = env;
+            const size_t comma = v.find(',');
+            if (comma != std::string::npos) {
+                dfly_ts[0] = (float) atof(v.substr(0, comma).c_str());
+                dfly_ts[1] = (float) atof(v.substr(comma + 1).c_str());
+            }
+        }
+        mparams.split_mode   = LLAMA_SPLIT_MODE_LAYER;
+        mparams.tensor_split = dfly_ts.data();
+        mparams.n_gpu_layers = 999;
+
+        cparams.n_ctx           = 64;
+        cparams.n_batch         = 16;
+        cparams.n_ubatch        = 16;
+        cparams.n_seq_max       = 1;
+        cparams.n_outputs_max   = 16; // one output (the draft token id) per row of the block
+        cparams.n_outputs_max_per_seq = 0;
+        cparams.embeddings      = true;
+        cparams.pooling_type    = LLAMA_POOLING_TYPE_NONE;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
@@ -3206,7 +3385,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3219,6 +3398,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLY,     params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  params.draft.ctx_dft != nullptr);
@@ -3241,6 +3421,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLY: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_dfly>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:

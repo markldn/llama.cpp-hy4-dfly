@@ -1,5 +1,8 @@
 # llama.cpp
 
+> **Fork notice:** this fork of [Little0o0/llama.cpp](https://github.com/Little0o0/llama.cpp) (Hy4-Flash support, ggml-org/llama.cpp PR #32517)
+> adds an experimental **DFly speculative decoder** for Hy4-Flash (`--spec-type draft-dfly`). See [docs/hy4-dfly.md](docs/hy4-dfly.md).
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

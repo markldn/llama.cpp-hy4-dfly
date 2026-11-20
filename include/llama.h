@@ -1178,6 +1178,19 @@ extern "C" {
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+    // Hy4-flash DFly drafter: tap the indexer selection (cell indices) of the given target layers (n_layers <= 8, 0 = off)
+    // during decode; read it back (host) for the row that chose the drafter's anchor token.
+    LLAMA_API void llama_set_dfly_tap(struct llama_context * ctx, const uint32_t * layers, int32_t n_layers);
+    LLAMA_API bool llama_get_dfly_tap(struct llama_context * ctx, int32_t slot, int32_t * k, int32_t * n_rows,
+            const int32_t ** idx, const float ** val);
+    // drafter context: the row of the target's last decode (rows of llama_get_embeddings_nextn) that chose the anchor
+    LLAMA_API void llama_set_dfly_src_row(struct llama_context * ctx, int32_t row);
+
+    // Hy4-flash DFly drafter info: the number of target layers it taps (<= max_layers, written to `layers`), 0 when the
+    // model is not a DFly drafter. n_spec: tokens drafted per pass, mask_token_id: the id of its mask token.
+    LLAMA_API int32_t llama_model_dfly_info(const struct llama_model * model, int32_t * n_spec, int32_t * mask_token_id,
+            uint32_t * layers, int32_t max_layers);
+
     // Select which appended NextN block the DECODER_MTP graph runs (offset past
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
     // chain multiple trained NextN heads. Default 0 (first head).

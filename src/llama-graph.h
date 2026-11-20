@@ -920,6 +920,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.dfly_n_tap              == other.cparams.dfly_n_tap              &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
@@ -991,6 +992,11 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // dfly taps, one entry per tapped target layer: selected cell indices (I32 [k, n_tokens]) and, per slot,
+    // 0.0 when live / -inf when dead (F32 [k, n_tokens])
+    std::vector<ggml_tensor *> t_dfly_idx;
+    std::vector<ggml_tensor *> t_dfly_val;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

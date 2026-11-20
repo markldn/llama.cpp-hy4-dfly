@@ -2415,6 +2415,39 @@ struct llama_model_hy_v4 : public llama_model_base {
 
 
 // hy_v4 iHC, gated MLA and sinks, with sparse and sliding-window layers, sandwich norms and latent routed experts
+// Hy4-flash DFly drafter: five dense MLA layers that read the target's K/V (layers kv_layers[]) through the
+// target's own selections (index share) and draft 5 tokens in one pass. No memory of its own.
+struct llama_model_hy_v4_flash_dfly : public llama_model_base {
+    llama_model_hy_v4_flash_dfly(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    uint32_t dfly_mask_token_id     = 0;
+    uint32_t dfly_n_spec            = 5;
+    uint32_t dfly_index_topk        = 2048;
+    bool     dfly_hidden_correction = true;
+    std::vector<uint32_t> dfly_kv_layers;    // target layer whose K/V draft layer i attends
+    std::vector<uint32_t> dfly_idx_layers;   // target layer whose selection draft layer i reuses
+
+    // global tensors (per-layer ones are in layers[])
+    struct ggml_tensor * dfly_fuse_eh_proj     = nullptr;
+    struct ggml_tensor * dfly_fuse_enorm       = nullptr;
+    struct ggml_tensor * dfly_fuse_hnorm       = nullptr;
+    struct ggml_tensor * dfly_fuse_gate        = nullptr;
+    struct ggml_tensor * dfly_hc_gate          = nullptr;
+    struct ggml_tensor * dfly_hc_up            = nullptr;
+    struct ggml_tensor * dfly_hc_down          = nullptr;
+    struct ggml_tensor * dfly_hc_hidden_norm   = nullptr;
+    struct ggml_tensor * dfly_hc_embed_norm    = nullptr;
+    struct ggml_tensor * dfly_embd_head        = nullptr; // copy of the target's token embedding on the head's device
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_hy_v4_flash : public llama_model_base {
     llama_model_hy_v4_flash(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

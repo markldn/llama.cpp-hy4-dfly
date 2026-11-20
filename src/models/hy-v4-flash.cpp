@@ -952,6 +952,27 @@ ggml_tensor * llama_model_hy_v4_flash::graph::build_attention(
         sel = build_kpool_select(cur, qr, inp_pos, freq_base_l, layer, mctx_idx, inp_kpool, il);
     }
 
+    // dfly drafter taps: the cells this row's indexer selected, as an index list plus a live/dead value per slot
+    if (sel != nullptr && cparams.dfly_n_tap > 0 && n_tokens <= 16) {
+        for (uint32_t t = 0; t < cparams.dfly_n_tap && t < 8; ++t) {
+            const int64_t top_k = hparams.indexer_top_k;
+            if ((uint32_t) il != cparams.dfly_tap_layers[t] || sel->ne[0] < top_k) {
+                continue;
+            }
+            ggml_tensor * sel_f = sel->type == GGML_TYPE_F32 ? sel : ggml_cast(ctx0, sel, GGML_TYPE_F32);
+            ggml_tensor * idx   = ggml_top_k(ctx0, sel_f, top_k); // [top_k, n_tokens] I32, unordered
+            ggml_tensor * val   = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, sel_f, 1, sel_f->ne[0], sel_f->ne[1]), idx);
+            if (res->t_dfly_idx.size() < cparams.dfly_n_tap) {
+                res->t_dfly_idx.resize(cparams.dfly_n_tap, nullptr);
+                res->t_dfly_val.resize(cparams.dfly_n_tap, nullptr);
+            }
+            res->t_dfly_idx[t] = idx;
+            res->t_dfly_val[t] = ggml_reshape_2d(ctx0, val, top_k, sel_f->ne[1]);
+            ggml_build_forward_expand(gf, res->t_dfly_idx[t]);
+            ggml_build_forward_expand(gf, res->t_dfly_val[t]);
+        }
+    }
+
     // wo is applied below so the gate can sit in front of it
     ggml_tensor * attn;
 

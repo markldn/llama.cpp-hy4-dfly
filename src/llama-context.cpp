@@ -206,6 +206,9 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.dfly_n_tap              = 0;
+    cparams.dfly_src_row            = 0;
+    for (auto & l : cparams.dfly_tap_layers) { l = 0; }
     cparams.no_perf                 = params.no_perf;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -239,6 +242,13 @@ llama_context::llama_context(
             throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
+        cparams.ctx_other = params.ctx_other;
+    }
+
+    if (model.arch == LLM_ARCH_HY_V4_FLASH_DFLY) {
+        if (params.ctx_other == nullptr) {
+            throw std::runtime_error("hy_v4_flash_dfly requires ctx_other to be set (this warning is normal during memory fitting)");
+        }
         cparams.ctx_other = params.ctx_other;
     }
 
@@ -321,6 +331,12 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    // the dfly drafter has its own explicit attention (no flash attention, no memory)
+    if (model.arch == LLM_ARCH_HY_V4_FLASH_DFLY) {
+        cparams.flash_attn = false;
+        cparams.auto_fa    = false;
+    }
 
     // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
     // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
@@ -1423,6 +1439,37 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+void llama_context::set_dfly_tap(const uint32_t * layers, int32_t n_layers) {
+    const uint32_t n = (uint32_t) std::max(0, std::min(n_layers, 8));
+
+    bool changed = cparams.dfly_n_tap != n;
+    for (uint32_t i = 0; i < n; ++i) {
+        changed = changed || cparams.dfly_tap_layers[i] != layers[i];
+    }
+    if (changed) {
+        sched_need_reserve = true; // the taps change the graph
+    }
+
+    cparams.dfly_n_tap = n;
+    for (uint32_t i = 0; i < n; ++i) {
+        cparams.dfly_tap_layers[i] = layers[i];
+    }
+    dfly_tap_k    = 0;
+    dfly_tap_rows = 0;
+}
+
+bool llama_context::get_dfly_tap(int32_t slot, int32_t * k, int32_t * n_rows, const int32_t ** idx, const float ** val) const {
+    if (slot < 0 || slot >= 8 || (uint32_t) slot >= cparams.dfly_n_tap || dfly_tap_k <= 0 || dfly_tap_rows <= 0 ||
+            dfly_tap_idx[slot].size() != (size_t) dfly_tap_k*dfly_tap_rows) {
+        return false;
+    }
+    *k      = dfly_tap_k;
+    *n_rows = dfly_tap_rows;
+    *idx    = dfly_tap_idx[slot].data();
+    *val    = dfly_tap_val[slot].data();
+    return true;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2519,6 +2566,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
+            }
+        }
+
+        // dfly taps: copy the tapped indexer selections of this ubatch to the host (the drafter reads them)
+        if (cparams.dfly_n_tap > 0) {
+            dfly_tap_k    = 0;
+            dfly_tap_rows = 0;
+            for (uint32_t s = 0; s < cparams.dfly_n_tap && s < 8; ++s) {
+                ggml_tensor * ti = s < res->t_dfly_idx.size() ? res->t_dfly_idx[s] : nullptr;
+                ggml_tensor * tv = s < res->t_dfly_val.size() ? res->t_dfly_val[s] : nullptr;
+                if (ti == nullptr || tv == nullptr) {
+                    dfly_tap_k = 0;
+                    break;
+                }
+                const int32_t k    = (int32_t) ti->ne[0];
+                const int32_t rows = (int32_t) ti->ne[1];
+                dfly_tap_idx[s].resize((size_t) k*rows);
+                dfly_tap_val[s].resize((size_t) k*rows);
+                ggml_backend_t be_i = ggml_backend_sched_get_tensor_backend(sched.get(), ti);
+                ggml_backend_t be_v = ggml_backend_sched_get_tensor_backend(sched.get(), tv);
+                GGML_ASSERT(be_i != nullptr && be_v != nullptr);
+                ggml_backend_tensor_get_async(be_i, ti, dfly_tap_idx[s].data(), 0, (size_t) k*rows*sizeof(int32_t));
+                ggml_backend_tensor_get_async(be_v, tv, dfly_tap_val[s].data(), 0, (size_t) k*rows*sizeof(float));
+                dfly_tap_k    = k;
+                dfly_tap_rows = rows;
             }
         }
 
@@ -4738,6 +4810,20 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_dfly_tap(llama_context * ctx, const uint32_t * layers, int32_t n_layers) {
+    ctx->set_dfly_tap(layers, n_layers);
+}
+
+bool llama_get_dfly_tap(llama_context * ctx, int32_t slot, int32_t * k, int32_t * n_rows, const int32_t ** idx, const float ** val) {
+    ctx->synchronize();
+
+    return ctx->get_dfly_tap(slot, k, n_rows, idx, val);
+}
+
+void llama_set_dfly_src_row(llama_context * ctx, int32_t row) {
+    ctx->set_dfly_src_row(row);
 }
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {

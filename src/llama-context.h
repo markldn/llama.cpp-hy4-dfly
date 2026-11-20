@@ -122,6 +122,10 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    // dfly drafter (hy_v4_flash): tap the indexer selections of target layers, read by the drafter context
+    void set_dfly_tap(const uint32_t * layers, int32_t n_layers);
+    bool get_dfly_tap(int32_t slot, int32_t * k, int32_t * n_rows, const int32_t ** idx, const float ** val) const;
+    void set_dfly_src_row(int32_t row) { cparams.dfly_src_row = row; }
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
 
@@ -357,6 +361,12 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // dfly taps of the last decode (one ubatch): per slot, I32/F32 [k][n_rows] on the host
+    std::vector<int32_t> dfly_tap_idx[8];
+    std::vector<float>   dfly_tap_val[8];
+    int32_t              dfly_tap_k    = 0;
+    int32_t              dfly_tap_rows = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

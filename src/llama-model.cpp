@@ -321,6 +321,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_hy_v4(params);
         case LLM_ARCH_HY_V4_FLASH:
             return new llama_model_hy_v4_flash(params);
+        case LLM_ARCH_HY_V4_FLASH_DFLY:
+            return new llama_model_hy_v4_flash_dfly(params);
         case LLM_ARCH_SMOLLM3:
             return new llama_model_smollm3(params);
         case LLM_ARCH_OPENAI_MOE:
@@ -2998,6 +3000,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RND1:
         case LLM_ARCH_CLEF:
         case LLM_ARCH_KOKORO:
+        case LLM_ARCH_HY_V4_FLASH_DFLY:
         case LLM_ARCH_TINY_VOCA:
             {
                 res = nullptr;
@@ -3859,6 +3862,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         // HY_V4 rotates consecutive pairs, matching the reference implementation
         case LLM_ARCH_HY_V4:
         case LLM_ARCH_HY_V4_FLASH:
+        case LLM_ARCH_HY_V4_FLASH_DFLY:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
