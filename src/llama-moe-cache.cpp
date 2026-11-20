@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include "llama-moe-cache.h"
 
 #include "llama-graph.h"
@@ -634,6 +635,68 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+
+        if (!no_alloc) {
+            pin_host_experts();
+        }
+    }
+
+    // LLAMA_MOE_CACHE_PIN=1: the host experts of the cached layers are page-locked in place, so that the uploads are asynchronous
+    // DMA copies instead of blocking staged copies from pageable memory. Only these tensors are registered (not the whole mmap:
+    // the rest of the model, e.g. the n-gram embedding table, stays in the ordinary page cache).
+    void pin_host_experts() {
+        const char * env = getenv("LLAMA_MOE_CACHE_PIN");
+        if (env == nullptr || atoi(env) == 0) {
+            return;
+        }
+        // the registration of the backend is itself gated by this variable
+        setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
+
+        using register_fn_t = bool (*)(void *, size_t);
+        auto reg_fn = (register_fn_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[0].backend)), "ggml_backend_register_host_buffer");
+        if (reg_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_PIN: the backend cannot register host memory\n", __func__);
+            return;
+        }
+
+        const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+        std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (layers[il].ig < 0) {
+                continue;
+            }
+            for (const ggml_tensor * t : layers[il].experts) {
+                if (t->data == nullptr) {
+                    continue;
+                }
+                const uintptr_t b = (uintptr_t) t->data & ~(page - 1);
+                const uintptr_t e = ((uintptr_t) t->data + ggml_nbytes(t) + page - 1) & ~(page - 1);
+                spans.emplace_back(b, e);
+            }
+        }
+        // neighbouring tensors share boundary pages and registering a range twice fails: merge overlapping and touching spans
+        std::sort(spans.begin(), spans.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+        for (const auto & sp : spans) {
+            if (!merged.empty() && sp.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, sp.second);
+            } else {
+                merged.push_back(sp);
+            }
+        }
+
+        const int64_t t0 = ggml_time_us();
+        size_t total = 0;
+        size_t pinned = 0;
+        for (const auto & sp : merged) {
+            total += sp.second - sp.first;
+            if (reg_fn((void *) sp.first, sp.second - sp.first)) {
+                pinned += sp.second - sp.first;
+            }
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_PIN: pinned %.2f of %.2f GiB of host experts in %zu spans, %.1f s\n", __func__,
+            pinned/1024.0/1024.0/1024.0, total/1024.0/1024.0/1024.0, merged.size(), (ggml_time_us() - t0)/1e6);
     }
 
     // the device that caches layer il
