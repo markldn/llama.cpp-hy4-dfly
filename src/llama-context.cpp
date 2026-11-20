@@ -208,6 +208,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.dfly_n_tap              = 0;
     cparams.dfly_src_row            = 0;
+    cparams.dfly_noise              = nullptr;
     for (auto & l : cparams.dfly_tap_layers) { l = 0; }
     cparams.no_perf                 = params.no_perf;
 
@@ -4824,6 +4825,10 @@ bool llama_get_dfly_tap(llama_context * ctx, int32_t slot, int32_t * k, int32_t 
 
 void llama_set_dfly_src_row(llama_context * ctx, int32_t row) {
     ctx->set_dfly_src_row(row);
+}
+
+void llama_set_dfly_noise(llama_context * ctx, const float * noise) {
+    ctx->set_dfly_noise(noise);
 }
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {

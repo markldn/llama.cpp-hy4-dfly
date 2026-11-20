@@ -66,6 +66,7 @@ struct llama_cparams {
     uint32_t dfly_tap_layers[8];
     uint32_t dfly_n_tap;
     int32_t  dfly_src_row;
+    const float * dfly_noise; // see llama_set_dfly_noise()
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

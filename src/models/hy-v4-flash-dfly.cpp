@@ -19,6 +19,9 @@
 //
 // refs: vLLM vllm/models/hy_v4/nvidia/dfly*.py, Basalt src/models/hy4flash/dfly.hpp
 
+// candidates kept per draft step (the support of the sampled distribution)
+static constexpr int64_t DFLY_SAMPLE_K = 32;
+
 void llama_model_hy_v4_flash_dfly::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
@@ -45,8 +48,8 @@ void llama_model_hy_v4_flash_dfly::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    // the embeddings output carries the draft token ids: one float per row
-    hparams.n_embd_out_impl = 1;
+    // the embeddings output carries, per row: the draft token id, its DFLY_SAMPLE_K candidate ids and their logits
+    hparams.n_embd_out_impl = 1 + 2 * DFLY_SAMPLE_K;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -152,6 +155,16 @@ public:
             }
         }
         ggml_backend_tensor_set(loc_mask, m.data(), 0, m.size()*sizeof(float));
+
+        // sampling noise of the draft steps (zero = greedy)
+        if (noise != nullptr) {
+            if (cparams.dfly_noise != nullptr) {
+                ggml_backend_tensor_set(noise, cparams.dfly_noise, 0, ggml_nbytes(noise));
+            } else {
+                const std::vector<float> zero((size_t) ggml_nelements(noise), 0.0f);
+                ggml_backend_tensor_set(noise, zero.data(), 0, ggml_nbytes(noise));
+            }
+        }
     }
 
     // the graph only depends on the row count and the width of the tapped selections, not on their values
@@ -171,6 +184,7 @@ public:
     ggml_tensor * sel_idx  = nullptr; // I32 [k, n_tap]
     ggml_tensor * sel_val  = nullptr; // F32 [k, n_tap]
     ggml_tensor * loc_mask = nullptr; // F32 [n_rows, 1, n_rows]
+    ggml_tensor * noise    = nullptr; // F32 [DFLY_SAMPLE_K, n_masks], absent when there is nothing to draft
 
     const llama_cparams & cparams;
     int32_t n_tap;
@@ -243,6 +257,12 @@ llama_model_hy_v4_flash_dfly::graph::graph(const llama_model & model_base, const
     inp->loc_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_rows, 1, n_rows);
     ggml_set_input(inp->loc_mask);
     cb(inp->loc_mask, "dfly_loc_mask", -1);
+
+    if (n_masks > 0) {
+        inp->noise = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, DFLY_SAMPLE_K, n_masks);
+        ggml_set_input(inp->noise);
+        cb(inp->noise, "dfly_noise", -1);
+    }
 
     res->add_input(std::move(inp_up));
 
@@ -392,13 +412,16 @@ llama_model_hy_v4_flash_dfly::graph::graph(const llama_model & model_base, const
 
     // graph reservation runs one row: nothing to draft, keep the layers in the graph
     if (n_masks == 0) {
-        res->t_embd = ggml_scale(ctx0, ggml_view_2d(ctx0, zf, 1, 1, zf->nb[1], 0), 0.0f);
+        res->t_embd = ggml_scale(ctx0, ggml_view_2d(ctx0, zf, 1 + 2 * DFLY_SAMPLE_K, 1, zf->nb[1], 0), 0.0f);
         cb(res->t_embd, "result_embd", -1);
         ggml_build_forward_expand(gf, res->t_embd);
         return;
     }
 
-    // ---- sequential hidden correction + the target's output head, greedy
+    // ---- sequential hidden correction + the target's output head. Each step keeps the DFLY_SAMPLE_K best logits and takes
+    // the argmax of (logit + noise): greedy for zero noise, an exact sample of the truncated softmax(logit / temp) for
+    // temp * Gumbel noise. A row of the output is [token id, candidate ids, candidate logits].
+    constexpr int64_t Ks = DFLY_SAMPLE_K;
     ggml_tensor * prev_id = ggml_view_1d(ctx0, inp->tokens, 1, 0);               // the anchor's id
     ggml_tensor * ids = nullptr;
     for (int64_t j = 0; j < n_masks; ++j) {
@@ -414,18 +437,26 @@ llama_model_hy_v4_flash_dfly::graph::graph(const llama_model & model_base, const
         ggml_tensor * h2 = ggml_add(ctx0, zj, d);
 
         ggml_tensor * logits = ggml_mul_mat(ctx0, model_t->output, h2);          // [n_vocab, 1]
-        ggml_tensor * am = ggml_argmax(ctx0, logits);                            // I32 [1]
+        ggml_tensor * cand   = ggml_top_k(ctx0, logits, Ks);                     // I32 [Ks, 1], unordered
+        ggml_tensor * cl     = ggml_reshape_1d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], 1), cand), Ks); // F32 [Ks]
+        ggml_tensor * nz     = ggml_view_1d(ctx0, inp->noise, Ks, (size_t) j*inp->noise->nb[1]);
+        ggml_tensor * slot   = ggml_argmax(ctx0, ggml_add(ctx0, cl, nz));        // I32 [1]
+        ggml_tensor * am     = ggml_reshape_1d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cand, 1, Ks), slot), 1); // I32 [1]
         cb(am, "dfly_draft", (int) j);
 
-        ggml_tensor * af = ggml_cast(ctx0, am, GGML_TYPE_F32);
-        ids = ids ? ggml_concat(ctx0, ids, af, 0) : af;
+        ggml_tensor * row_j = ggml_concat(ctx0,
+                ggml_concat(ctx0, ggml_cast(ctx0, am, GGML_TYPE_F32), ggml_cast(ctx0, ggml_reshape_1d(ctx0, cand, Ks), GGML_TYPE_F32), 0),
+                cl, 0);                                                          // F32 [1 + 2*Ks]
+        ids = ids ? ggml_concat(ctx0, ids, row_j, 0) : row_j;
         prev_id = am;
     }
 
-    // [1, n_rows]: row 0 is unused (zero), rows 1.. are the draft token ids
-    ggml_tensor * zero = ggml_scale(ctx0, ggml_view_1d(ctx0, ids, 1, 0), 0.0f);
+    // [1 + 2*Ks, n_rows]: row 0 is unused (zero), rows 1.. are [draft token id, candidate ids, candidate logits]
+    ggml_tensor * zero = ggml_scale(ctx0, ggml_view_1d(ctx0, ids, 1 + 2*Ks, 0), 0.0f);
     ggml_tensor * all  = ggml_concat(ctx0, zero, ids, 0);
-    res->t_embd = ggml_reshape_2d(ctx0, all, 1, n_rows);
+    res->t_embd = ggml_reshape_2d(ctx0, all, 1 + 2*Ks, n_rows);
     cb(res->t_embd, "result_embd", -1);
 
     ggml_build_forward_expand(gf, res->t_embd);

@@ -20,7 +20,7 @@ DFly follows the algorithm described in Tencent's AngelSpec paper and implemente
 2. **Five dense MLA layers** run over a block of rows (the anchor plus up to 5 mask tokens). They have no cache of their own:
    each layer attends the **target's** K cache of a fixed target layer (layers 25, 29, 33, 37, 41 for Hy4-Flash), restricted
    to the cells the target's indexer selected for the source row (*index share*), plus the block's own rows.
-3. A **sequential hidden correction** and the target's own output head turn the block into draft tokens (greedy).
+3. A **sequential hidden correction** and the target's own output head turn the block into draft tokens (greedy, or sampled, see below).
 4. The target verifies the drafts as in any other speculative method.
 
 In llama.cpp terms:
@@ -76,14 +76,23 @@ The state is reset at the start of every request.
 * `LLAMA_DFLY_GATE_MIN_ACC=<value>` overrides it; `0` turns the gate off (always draft).
 * On setups where a multi-row verify step is nearly free, lower the threshold (or turn the gate off).
 
+### Sampled drafting
+
+`LLAMA_DFLY_SAMPLE=1` makes the drafter sample instead of taking the argmax whenever the request has a temperature above 0.
+Each draft step keeps its 32 best logits and picks one with Gumbel-max noise supplied by the host (an exact sample of
+`softmax(logits / temp)` over those candidates, seeded from the request seed). The sampled token feeds the next step, and the
+candidate distribution is handed to the server, which verifies by rejection sampling (accept with probability `min(1, p/q)`,
+otherwise resample from the residual), so the output distribution is the target's. Greedy requests are unchanged. Sampled
+drafting raises the acceptance of drafts when sampling noise, not draft quality, is what makes them miss.
+
 ### Limitations
 
 * Single sequence only.
 * The target only produces the indexer selections once the KV cache view holds at least `indexer_top_k` (2048) cells, so
   short conversations are not drafted. Decodes of more than 16 rows (prompt chunks) are not drafted either; the first
   step after a long prompt is a normal step.
-* Drafts are greedy and deterministic: with sampling, a draft is accepted when the target's sampled token equals it.
-  Probabilistic drafting with rejection sampling is not implemented.
+* By default drafts are greedy: with sampling, a draft is accepted when the target's sampled token equals it (see
+  [Sampled drafting](#sampled-drafting) for the alternative).
 * The drafter needs the target's K cache; it is only usable with the `hy_v4_flash` target and its sparse layers.
 
 ## When it helps

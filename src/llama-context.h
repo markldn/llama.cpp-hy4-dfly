@@ -126,6 +126,7 @@ struct llama_context {
     void set_dfly_tap(const uint32_t * layers, int32_t n_layers);
     bool get_dfly_tap(int32_t slot, int32_t * k, int32_t * n_rows, const int32_t ** idx, const float ** val) const;
     void set_dfly_src_row(int32_t row) { cparams.dfly_src_row = row; }
+    void set_dfly_noise(const float * noise) { cparams.dfly_noise = noise; }
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
 

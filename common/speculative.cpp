@@ -2344,6 +2344,14 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
     // growing back-off. The threshold defaults to 0.66 * n_max; LLAMA_DFLY_GATE_MIN_ACC overrides it (0 = gate off).
     double  gate_min_acc = 2.0;
     double  gate_ema     = 3.0;
+
+    // sampled drafting (LLAMA_DFLY_SAMPLE=1): at temp > 0 the drafter samples its tokens from the top-k of its own
+    // distribution and hands that distribution to the verifier, which then does rejection sampling (lossless)
+    bool                     sample_enabled = false;
+    std::mt19937             sample_rng;
+    uint32_t                 sample_seed    = 0;
+    bool                     sample_seeded  = false;
+    std::vector<float>       sample_noise;
     int32_t gate_off     = 0;   // draft() calls left to skip
     int32_t gate_backoff = 8;   // length of the next skip
     bool    gate_probing = false;
@@ -2381,6 +2389,11 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
             gate_min_acc = std::atof(e);
         }
         SPC_TRC("- acceptance gate: min mean accepted drafts per step = %.2f (0 = off)\n", gate_min_acc);
+
+        if (const char * e = std::getenv("LLAMA_DFLY_SAMPLE")) {
+            sample_enabled = std::atoi(e) != 0;
+        }
+        SPC_TRC("- sampled drafting at temp > 0: %s\n", sample_enabled ? "on" : "off");
 
         // the drafter reads the target's last hidden state, K cache and indexer selections
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
@@ -2464,13 +2477,37 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
 
         llama_set_dfly_src_row(ctx_dft, row);
 
+        // candidates per step: the drafter's embeddings rows are [token id, k ids, k logits]
+        const int32_t n_cand = (llama_model_n_embd_out(llama_get_model(ctx_dft)) - 1) / 2;
+
+        const bool sample = sample_enabled && dp.result_q != nullptr && dp.temp > 0.0f && n_cand > 0;
+        if (sample) {
+            if (!sample_seeded || sample_seed != dp.seed) {
+                sample_seeded = true;
+                sample_seed   = dp.seed;
+                // the default seed means random; mixed so it differs from the target's
+                sample_rng.seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+            }
+            // argmax(logit + temp * g) with g ~ Gumbel(0, 1) samples softmax(logit / temp)
+            sample_noise.resize((size_t) n_draft * n_cand);
+            std::uniform_real_distribution<double> uni(1e-12, 1.0 - 1e-12);
+            for (auto & v : sample_noise) {
+                v = (float) (-(double) dp.temp * std::log(-std::log(uni(sample_rng))));
+            }
+            llama_set_dfly_noise(ctx_dft, sample_noise.data());
+        } else {
+            llama_set_dfly_noise(ctx_dft, nullptr);
+        }
+
         batch.clear();
         batch.add(dp.id_last, dp.pos0, 0, true);
         for (int32_t j = 0; j < n_draft; ++j) {
             batch.add(mask_id, dp.pos0 + 1 + j, 0, true);
         }
 
-        if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_ENCODE, batch.get()) != 0) {
+        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+        llama_set_dfly_noise(ctx_dft, nullptr);
+        if (rc != 0) {
             SPC_WRN("%s", "draft-dfly: drafter pass failed, no draft\n");
             return;
         }
@@ -2480,13 +2517,39 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
             const float * e = llama_get_embeddings_ith(ctx_dft, 1 + j);
             if (e == nullptr) {
                 dp.result->clear();
+                if (sample) {
+                    dp.result_q->clear();
+                }
                 return;
             }
             dp.result->push_back((llama_token) std::lround(e[0]));
+
+            if (sample) {
+                // q: the candidates the token was sampled from, softmax(logit / temp) over them
+                const float * ids = e + 1;
+                const float * lg  = e + 1 + n_cand;
+                float mx = lg[0];
+                for (int32_t k = 1; k < n_cand; ++k) {
+                    mx = std::max(mx, lg[k]);
+                }
+                auto & q = dp.result_q->emplace_back();
+                q.reserve(n_cand);
+                float sum = 0.0f;
+                for (int32_t k = 0; k < n_cand; ++k) {
+                    const float w = std::exp((lg[k] - mx) / dp.temp);
+                    sum += w;
+                    q.push_back({ (llama_token) std::lround(ids[k]), lg[k], w });
+                }
+                for (auto & c : q) {
+                    c.p /= sum;
+                }
+            }
         }
 
-        // deterministic drafts: the verifier samples the target and matches
-        dp.result_q = nullptr;
+        if (!sample) {
+            // deterministic drafts: the verifier samples the target and matches
+            dp.result_q = nullptr;
+        }
         n_draft_last = n_draft;
     }
 

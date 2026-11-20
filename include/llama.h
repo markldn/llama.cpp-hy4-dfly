@@ -1185,6 +1185,11 @@ extern "C" {
             const int32_t ** idx, const float ** val);
     // drafter context: the row of the target's last decode (rows of llama_get_embeddings_nextn) that chose the anchor
     LLAMA_API void llama_set_dfly_src_row(struct llama_context * ctx, int32_t row);
+    // drafter context: noise for the next pass, n_masks * k floats with k = (llama_model_n_embd_out(drafter) - 1) / 2.
+    // Every draft step takes the argmax of (its k best logits + noise): a sample of softmax(logits / temp) when the noise
+    // is temp * Gumbel(0, 1), the greedy token when it is zero. The embeddings output rows are
+    // [token id, k candidate ids, k candidate logits]. The pointer must stay valid until the pass is done; nullptr = greedy.
+    LLAMA_API void llama_set_dfly_noise(struct llama_context * ctx, const float * noise);
 
     // Hy4-flash DFly drafter info: the number of target layers it taps (<= max_layers, written to `layers`), 0 when the
     // model is not a DFly drafter. n_spec: tokens drafted per pass, mask_token_id: the id of its mask token.
