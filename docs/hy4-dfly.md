@@ -55,12 +55,26 @@ before use.
 ## Usage
 
 ```bash
-llama-server -m target.gguf -md drafter-llama.gguf --spec-draft-n-max 3 --parallel 1 ...
+llama-server -m target.gguf -md drafter-llama.gguf --spec-draft-n-max 5 --parallel 1 ...
 ```
 
 * The speculative type is detected from the drafter's architecture; `--spec-type draft-dfly` selects it explicitly.
-* `--spec-draft-n-max N` is the number of tokens drafted per step (at most 5, the number the drafter was trained for).
+* `--spec-draft-n-max N` is the number of tokens drafted per step (default 3, at most 5, the number the drafter was trained
+  for). 5 is the best choice for predictable output such as rewriting code; with the gate below it is safe to leave on.
 * Use `--parallel 1` (a single sequence is supported).
+
+### Adaptive acceptance gate
+
+A verification step of several rows can cost several plain steps, so drafting only pays while most drafted tokens are
+accepted. `draft-dfly` therefore keeps a running mean of the accepted drafts per drafted step and stops drafting while it is
+below a threshold, falling back to plain decoding. It probes again after a back-off that starts at 8 steps and doubles up to
+256, so drafting resumes when the output becomes predictable again (for example when the model starts rewriting code).
+The state is reset at the start of every request.
+
+* The threshold defaults to `0.66 * n_max` accepted drafts per drafted step, about the break-even point when a
+  multi-row step costs roughly three plain steps.
+* `LLAMA_DFLY_GATE_MIN_ACC=<value>` overrides it; `0` turns the gate off (always draft).
+* On setups where a multi-row verify step is nearly free, lower the threshold (or turn the gate off).
 
 ### Limitations
 
@@ -80,7 +94,8 @@ Speculative decoding trades a more expensive verification step for several token
 * a large share of the drafts is accepted (predictable output such as code continuation or structured text).
 
 On setups where a multi-token step is much more expensive than a single-token step (for example when most expert weights
-are streamed from host memory), or for hard-to-predict text, plain decoding can be as fast or faster. Measure with your own
+are streamed from host memory), or for hard-to-predict text, plain decoding can be as fast or faster; the adaptive gate keeps
+the cost of the unpredictable parts small, so the gain on predictable parts (code edits, structured output) is kept. Measure with your own
 workload: `llama-server` reports `draft_n` / `draft_n_accepted` in the response `timings`, and `llama-dfly-test` compares
 plain and speculative decoding on a prompt and checks that the outputs match.
 

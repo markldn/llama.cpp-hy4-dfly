@@ -2338,6 +2338,17 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
     // positions of the rows of the last target decode (taps and hidden rows only exist for decodes of <= 16 rows)
     std::vector<llama_pos> rows_pos;
 
+    // adaptive gate. A verify step of n_draft+1 rows costs several plain steps when the experts live in system
+    // memory, so drafting only pays while most drafted tokens are accepted. The gate keeps a running mean of the
+    // accepted drafts per drafted step, stops drafting while it is below gate_min_acc, and probes again after a
+    // growing back-off. The threshold defaults to 0.66 * n_max; LLAMA_DFLY_GATE_MIN_ACC overrides it (0 = gate off).
+    double  gate_min_acc = 2.0;
+    double  gate_ema     = 3.0;
+    int32_t gate_off     = 0;   // draft() calls left to skip
+    int32_t gate_backoff = 8;   // length of the next skip
+    bool    gate_probing = false;
+    int32_t n_draft_last = 0;
+
     common_speculative_impl_draft_dfly(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLY, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2365,6 +2376,12 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
         SPC_TRC("%s", "adding speculative implementation 'draft-dfly'\n");
         SPC_TRC("- n_max=%d (drafter block %d), mask_id=%d, tapped target layers=%d\n", this->n_max, n_block, (int) mask_id, n_layers);
 
+        gate_min_acc = 0.66 * this->n_max; // break-even is about two thirds of the drafts accepted
+        if (const char * e = std::getenv("LLAMA_DFLY_GATE_MIN_ACC")) {
+            gate_min_acc = std::atof(e);
+        }
+        SPC_TRC("- acceptance gate: min mean accepted drafts per step = %.2f (0 = off)\n", gate_min_acc);
+
         // the drafter reads the target's last hidden state, K cache and indexer selections
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_dfly_tap(ctx_tgt, layers, n_layers);
@@ -2381,6 +2398,11 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
         rows_pos.clear();
+        gate_ema     = 3.0;
+        gate_off     = 0;
+        gate_backoff = 8;
+        gate_probing = false;
+        n_draft_last = 0;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -2395,6 +2417,12 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
         auto & dp = dparams[0];
         if (!dp.drafting) {
             return;
+        }
+
+        n_draft_last = 0;
+        if (gate_off > 0) {
+            gate_off--;
+            return; // low acceptance lately: a plain step is cheaper than a verify step
         }
 
         auto * ctx_tgt = params.ctx_tgt;
@@ -2459,9 +2487,29 @@ struct common_speculative_impl_draft_dfly : public common_speculative_impl {
 
         // deterministic drafts: the verifier samples the target and matches
         dp.result_q = nullptr;
+        n_draft_last = n_draft;
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {}
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool is_other) override {
+        if (is_other || gate_min_acc <= 0.0 || n_draft_last <= 0) {
+            return;
+        }
+        n_draft_last = 0;
+
+        // a probe step after a pause weighs more, so one bad probe switches the drafter off again
+        const double a = gate_probing ? 0.5 : 0.2;
+        gate_ema = (1.0 - a) * gate_ema + a * (double) n_accepted;
+
+        if (gate_ema < gate_min_acc) {
+            gate_off     = gate_backoff;
+            gate_backoff = std::min<int32_t>(gate_backoff * 2, 256);
+            gate_ema     = gate_min_acc + 0.1; // the next probe starts just above the bar
+            gate_probing = true;
+        } else {
+            gate_backoff = 8;
+            gate_probing = false;
+        }
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
